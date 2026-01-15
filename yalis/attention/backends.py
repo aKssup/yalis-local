@@ -2,7 +2,7 @@
 from . import sdpa_and_flex  # noqa: F401
 from . import flash  # noqa: F401
 from . import thresh
-from . import topk
+# from . import topk
 
 from enum import Enum
 
