@@ -215,6 +215,7 @@ class LLMEngine:
         model = get_model(
             model_config.model_path,
             self.dtype,
+            inference_config,
             max_sequence_length=inference_config.max_length,
             random_init=False,
             use_intra_head_parallelism=inference_config.use_intra_head_parallelism,  # noqa: E501
