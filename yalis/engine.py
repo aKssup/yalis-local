@@ -34,6 +34,8 @@ torch._inductor.config.assert_indirect_indexing = False
 
 torch._inductor.config.combo_kernel_foreach_dynamic_shapes = True
 
+torch._dynamo.config.capture_scalar_outputs = True
+
 
 YALIS_DISABLE_COMPILE = os.environ.get("YALIS_DISABLE_COMPILE", "0") == "1"
 
@@ -104,29 +106,34 @@ def generate(
     top_k=None,
     top_p=1.0,
     get_logits=False,
+    get_probs=False,
+    warmup: Optional[bool] = None,
     phase: EnginePhase = EnginePhase.DECODE_SINGLE,
 ):
     """
     Generate function for producing the next token(s).
 
-    Args:
-        model: The model to generate from.
-        tokens: Input tokens tensor.
-        input_pos: Position indices for the tokens.
-        get_logits: If True, returns logits as well.
-
     Returns:
         token_id: The next predicted token.
-        logits: (Optional) The raw logits from the model.
+        logits: (Optional) The raw logits from the model (last position).
     """
-    logits = model(tokens, phase)["logits"].to(torch.float32)
+    if warmup is None:
+        out = model(tokens, phase)
+    else:
+        # Needed for thresh attention: it asserts the presence of a warmup flag.
+        out = model(tokens, phase, warmup=warmup)
+
+    logits = out["logits"].to(torch.float32)
     token_id = sample(
         logits=logits[:, -1], temperature=temperature, top_k=top_k, top_p=top_p
     )
+
+    # NOTE: Keep return signature stable (token_id, logits_or_None)
+    if get_probs:
+        return token_id, logits
     if get_logits:
         return token_id, logits[:, -1]
-    else:
-        return token_id, None
+    return token_id, None
 
 
 @torch.inference_mode()
@@ -239,7 +246,10 @@ class LLMEngine:
         tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
         # Check if the tokenizer has a pad token, otherwise use eos_token
         if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            if "Mistral" in model_config.model_name:
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                tokenizer.pad_token = tokenizer.eos_token
             print_rank0(
                 "Pad token not found in the tokenizer."
                 "Using eos_token as pad token."
@@ -391,6 +401,13 @@ class LLMEngine:
         output_logits = []
         # Start timing the operations
         timers.start("generate")
+
+        # Thresh attention support (minimal)
+        is_thresh = self.inference_config.attention_backend == "thresh"
+        num_generation_step = 0
+        if is_thresh and hasattr(self.model, "generation_counter"):
+            self.model.generation_counter.zero_()
+
         self.model.token_counter.zero_()
         if self.inference_config.use_paged_kv_caching:
             self.model.kv_cache_manager.reset()
@@ -421,7 +438,13 @@ class LLMEngine:
                     current_input_to_model = next_token.clone()
                     nvtx_range_pop()
                 else:  # Generation step
-                    timer_key = "decode"
+                    if is_thresh:
+                        warmup = num_generation_step < self.inference_config.num_warmup_steps
+                        timer_key = "warmup" if warmup else "decode"
+                    else:
+                        warmup = False
+                        timer_key = "decode"
+
                     timers.start(timer_key)
                     nvtx_range_push("Decode")
                     with sdpa_kernel(SDPBackend.MATH):
@@ -432,12 +455,20 @@ class LLMEngine:
                             top_k=self.inference_config.top_k,
                             top_p=self.inference_config.top_p,
                             get_logits=get_logits,
+                            warmup=(warmup if is_thresh else None),
                         )  # Call generate function
 
-                    current_input_to_model.copy_(
-                        next_token
-                    )  # Copy the new token into tokens
+                    current_input_to_model.copy_(next_token)  # Copy the new token into tokens
                     nvtx_range_pop()
+
+                    # Warmup bookkeeping (thresh attention)
+                    if is_thresh:
+                        num_generation_step += 1
+                        if (
+                            num_generation_step == self.inference_config.num_warmup_steps
+                            and hasattr(self.model, "fit_powerlaw")
+                        ):
+                            self.model.fit_powerlaw()
 
                 # EOS Support:
                 # Flatten to shape (batch_size,) for element wise comparison

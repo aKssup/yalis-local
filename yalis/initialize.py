@@ -24,4 +24,4 @@ def init_distributed(tp_dims=None):
     if dist.get_rank() != 0:
         # Suppress warnings from all non-zero ranks
         warnings.filterwarnings("ignore", category=UserWarning)
-    seed_everything(1234)
+    # seed_everything(1234)

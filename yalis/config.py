@@ -90,6 +90,18 @@ class InferenceConfig:
     Configuration for inference parameters.
     """
 
+    def get_next_power_of_2(self, n: int) -> int:
+        """
+        Get the next power of 2 greater than or equal to n.
+        Args:
+            n (int): The input number.
+        Returns:
+            int: The next power of 2.
+        """
+        if n < 1:
+            raise ValueError("Input must be a positive integer.")
+        return 1 << (n - 1).bit_length()
+
     def __init__(
         self,
         max_batch_size: int = 1,
@@ -106,6 +118,8 @@ class InferenceConfig:
         symmetric_allreduce_strategy: Optional[
             Literal["one-shot", "two-shot", "nvshmem"]
         ] = None,
+        threshold_percentile: Optional[float] = 0.0,
+        num_warmup_steps: Optional[int] = 64,
     ):
         """
         Initialize the inference configuration.
@@ -146,11 +160,13 @@ class InferenceConfig:
         self.prestore_kv_cache = prestore_kv_cache
         self.symmetric_allreduce_strategy = symmetric_allreduce_strategy
 
-        if attention_backend not in ["flash", "sdpa", "flex"]:
+        if attention_backend not in ["flash", "sdpa", "flex", "thresh", "topk"]:
             raise ValueError(
-                f"Invalid attention backend: {attention_backend}. Supported values are 'flash', 'sdpa', 'flex'."  # noqa: E501
+                f"Invalid attention backend: {attention_backend}. Supported values are 'flash', 'sdpa', 'flex', 'thresh', 'topk'."  # noqa: E501
             )
         self.attention_backend = AttentionBackend(attention_backend)
+        self.threshold_percentile = threshold_percentile
+        self.num_warmup_steps = num_warmup_steps
         try:
             pkg_ver = version("torch")
         except PackageNotFoundError:

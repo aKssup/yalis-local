@@ -180,13 +180,14 @@ def rotary_kv_update_sdpa_gen(
                 block_mask=flex_attention_block_mask,
             )
         else:
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k_cache[:B],
-                v_cache[:B],
-                attn_mask=mask[:, None, None, :],
-                enable_gqa=enable_gqa,
-            )
+            with torch.profiler.record_function("SDPADecode"):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k_cache[:B],
+                    v_cache[:B],
+                    attn_mask=mask[:, None, None, :],
+                    enable_gqa=enable_gqa,
+                )
         return out
 
 

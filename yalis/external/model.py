@@ -26,6 +26,7 @@ from kvcache_manager import KVCacheManager
 from yalis.attention.flash import flash_apply_rotary as apply_rotary
 from yalis.attention.backends import AttentionBackend
 from yalis.attention.masking import create_causal_block_mask_for_flex_attention
+from yalis.attention.utils import fit_powerlaw_linreg_torch
 
 
 # TODO: these should be dynamically set during engine initialization
@@ -120,9 +121,11 @@ class GPT(nn.Module):
         input_ids: torch.Tensor,
         phase: EnginePhase,
         actual_sequence_lengths: torch.Tensor = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         idx = input_ids
         T = idx.size(1)
+        B = idx.size(0)
         if self.max_seq_length < T:
             raise ValueError(
                 f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}."  # noqa: E501
@@ -187,16 +190,18 @@ class GPT(nn.Module):
             else None
         )
 
+        retain_perc_g = torch.zeros((B, 1), dtype=torch.float32, device=x.device)
+
         for block in self.transformer.h:
-            x = block(
-                x,
-                self.cos,
-                self.sin,
-                phase,
-                self.token_counter,
-                block_table,
-                flex_attention_block_mask,
-            )
+            x, retain_perc = block(x, self.cos, self.sin, self.token_counter, block_table, flex_attention_block_mask, self.generation_counter, warmup=warmup)
+            retain_perc_g += retain_perc
+
+        # Average the retain percentage across all blocks
+        retain_perc_mean = retain_perc_g / len(self.transformer.h)
+
+        # All reduce retain percentage across all ranks
+        dist.all_reduce(retain_perc_mean, op=dist.ReduceOp.AVG)
+
         if self.config.tensor_parallel:
             x = Gather.apply(
                 x, ax.comm_handle.inner_intra_layer_parallel_group
@@ -211,6 +216,9 @@ class GPT(nn.Module):
         self.token_counter[:B].add_(
             T if actual_sequence_lengths is None else actual_sequence_lengths
         )
+
+        self.generation_counter.add_(1)
+
         if self.config.use_paged_kv_caching:
             # NOTE: Paged KV: readjusting the token counters of the block table
             # to exclude padded tokens.
@@ -218,7 +226,7 @@ class GPT(nn.Module):
             torch.ops.yalis.force_update_tokens_assigned_(
                 self.tokens_assigned[:B], self.token_counter[:B]
             )
-        return {"logits": x}
+        return {"logits": x, "retain_perc": retain_perc_mean}
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -325,6 +333,22 @@ class GPT(nn.Module):
                 device,
                 dtype,
             )
+            if self.config.attention_backend == AttentionBackend.THRESH:
+                if self.config.tensor_parallel:
+                    attention_world_size = ax.config.G_intra_r
+                    assert self.config.n_head % attention_world_size == 0
+                    heads = self.config.n_head // attention_world_size
+                else:
+                    heads = self.config.n_head
+
+                # For thresh warmup
+                block.attn.warmup_quantiles = torch.zeros(
+                    max_batch_size,
+                    heads,
+                    self.config.num_warmup_steps,
+                    dtype=dtype,
+                    device=device,
+                )
         if self.config.use_paged_kv_caching:
             self.kv_cache_manager = KVCacheManager(
                 max_batch_size,
@@ -343,6 +367,7 @@ class GPT(nn.Module):
         self.token_counter = torch.zeros(
             max_batch_size, device=device, dtype=torch.int32
         )
+        self.generation_counter = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
 
     def rewind_kv_cache(self, num_tokens: torch.Tensor) -> None:
         """
@@ -356,6 +381,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.kv_cache = None
         torch.cuda.empty_cache()
+
+    def fit_powerlaw(self):
+        for block in self.transformer.h:
+            block.attn.fit_power_law()
 
     def create_symmetric_memory_pool(
         self,
@@ -436,6 +465,8 @@ class Block(nn.Module):
         token_counter: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
         flex_attention_block_mask=None,
+        generation_counter: Optional[torch.Tensor] = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -459,7 +490,7 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(
+        attention_output, retain_perc = self.attn(
             x_normed,
             cos,
             sin,
@@ -467,6 +498,8 @@ class Block(nn.Module):
             token_counter,
             block_table,
             flex_attention_block_mask,
+            generation_counter,
+            warmup=warmup,
         )
         attention_output = self.post_attention_norm(attention_output)
 
@@ -482,7 +515,7 @@ class Block(nn.Module):
         else:
             x = attention_output + x
             x = self.post_mlp_norm(self.mlp(self.norm_2(x))) + x
-        return x
+        return x, retain_perc
 
 
 class CausalSelfAttention(nn.Module):
@@ -520,10 +553,17 @@ class CausalSelfAttention(nn.Module):
             )
         # disabled by default
         self.kv_cache: Optional[KVCache] = None
-        self.apply_sliding_window_attention = (
-            config.sliding_window_size is not None
-            and block_idx % config.sliding_window_layer_placing == 0
-        )
+        # self.apply_sliding_window_attention = (
+        #     config.sliding_window_size is not None
+        #     and block_idx % config.sliding_window_layer_placing == 0
+        # )
+
+        # Used by thresh attention
+        self.warmup_quantiles = None
+        self.threshold_percentile = config.threshold_percentile
+        self.num_warmup_steps = config.num_warmup_steps
+        self.powerlaw_a = None
+        self.powerlaw_b = None
 
         if config.norm_qk:
             assert config.norm_qk_type == "default"
@@ -568,6 +608,19 @@ class CausalSelfAttention(nn.Module):
                 assert self.config.n_query_groups % attention_world_size == 0
                 self.config.n_query_groups //= attention_world_size
 
+    def fit_power_law(self):
+        if self.config.attention_backend == AttentionBackend.THRESH:
+            x = torch.arange(0, self.num_warmup_steps, dtype=self.warmup_quantiles.dtype, device=self.warmup_quantiles.device).unsqueeze(0).unsqueeze(0)
+            x = x.expand(self.warmup_quantiles.size(0), self.warmup_quantiles.size(1), self.num_warmup_steps)
+            #print_rank0(f"Fitting power law for block {self.config.block_idx}")
+            self.powerlaw_a, self.powerlaw_b, r2 = fit_powerlaw_linreg_torch(
+                x,
+                self.warmup_quantiles,
+            )
+        else:
+            pass
+            #raise NotImplementedError("Power law fitting is only supported for THRESH attention backend")
+
     def forward(
         self,
         x: torch.Tensor,
@@ -577,6 +630,8 @@ class CausalSelfAttention(nn.Module):
         token_counter: torch.Tensor,
         block_table: torch.Tensor = None,
         flex_attention_block_mask=None,
+        generation_counter: Optional[torch.Tensor] = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         B, T, C = (
             x.size()
@@ -622,6 +677,8 @@ class CausalSelfAttention(nn.Module):
             k = k.transpose(1, 2).contiguous()
             v = v.transpose(1, 2).contiguous()
 
+        retain_perc = torch.zeros((B, 1), device=x.device, dtype=torch.float32)
+
         # NOTE: Pass full k_cache, v_cache, and token_counter.
         # Slicing for current batch size is done in the respective backends.
         y = attention_wrapper(
@@ -639,6 +696,13 @@ class CausalSelfAttention(nn.Module):
             use_intra_head_parallelism=self.config.use_intra_head_parallelism,
             prestore_kv_cache=self.config.prestore_kv_cache,
             flex_attention_block_mask=flex_attention_block_mask,
+            generation_counter=generation_counter,
+            warmup_quantiles=self.warmup_quantiles,
+            warmup=warmup,
+            threshold_percentile=self.threshold_percentile,
+            retain_perc=retain_perc,
+            powerlaw_a=self.powerlaw_a,
+            powerlaw_b=self.powerlaw_b,
         )
 
         if not self.config.attention_backend == AttentionBackend.FLASH:
@@ -649,7 +713,7 @@ class CausalSelfAttention(nn.Module):
         )  # re-assemble all head outputs side by side
 
         # output projection
-        return self.proj(y)
+        return self.proj(y), retain_perc
 
     def build_kv_cache(
         self,
