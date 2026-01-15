@@ -49,16 +49,16 @@ if __name__ == "__main__":
 
     input_prompts = []
     for user_prompt in user_prompts:
-        conversation = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },  # not needed for gemma
-            {"role": "user", "content": user_prompt},
-        ]
-        formatted_prompt = tokenizer.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
-        )
+        if getattr(tokenizer, "chat_template", None):
+            conversation = [
+                {"role": "system", "content": system_prompt},  # not needed for gemma
+                {"role": "user", "content": user_prompt},
+            ]
+            formatted_prompt = tokenizer.apply_chat_template(
+                conversation, add_generation_prompt=True, tokenize=False
+            )
+        else:
+            formatted_prompt = f"{system_prompt}{user_prompt}\n"
         input_prompts.append(formatted_prompt)
 
     # Number of tokens to generate
