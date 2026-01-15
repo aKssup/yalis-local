@@ -306,10 +306,16 @@ class GPT(nn.Module):
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         if rope_cache_length is None:
-            rope_cache_length = self.cos.size(-1)
+            rope_cache_length = max_seq_length or self.max_seq_length
             if self.config.attention_backend == AttentionBackend.FLASH:
                 rope_cache_length *= 2
 
+        self.cos, self.sin = self.build_rope_cache(
+            rope_cache_length,
+            device=device,
+            dtype=dtype,
+        )
+        
         if max_seq_length is None:
             max_seq_length = self.max_seq_length
 
