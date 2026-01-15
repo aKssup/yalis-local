@@ -28,6 +28,8 @@ from yalis.attention.backends import AttentionBackend
 from yalis.attention.masking import create_causal_block_mask_for_flex_attention
 from yalis.attention.utils import fit_powerlaw_linreg_torch
 
+import torch.distributed as dist
+
 
 # TODO: these should be dynamically set during engine initialization
 NUM_BLOCKS, PAGE_BLOCK_SIZE = 512, 256
