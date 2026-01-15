@@ -65,7 +65,7 @@ if __name__ == "__main__":
     tokens_to_gen = 512
 
     # Max batch size
-    MAX_BATCH_SIZE = 32
+    MAX_BATCH_SIZE = 16
 
     if len(input_prompts) > MAX_BATCH_SIZE:
         raise ValueError(
