@@ -12,7 +12,10 @@ import torch
 import triton
 import triton.language as tl
 
-import vllm_ops  # noqa: F401
+try:
+    from vllm import _custom_ops as vllm_ops  # noqa: F401
+except Exception:
+    vllm_ops = None
 
 
 @triton.jit
