@@ -395,7 +395,7 @@ class LLMEngine:
             self.model.token_counter[:batch_size].zero_()
 
         if self.inference_config.use_paged_kv_caching:
-            self.model.kv_cache_manager.reset()
+            self.kv_slots_manager.reset()
 
     def warmup_prefill(
         self,
@@ -415,16 +415,26 @@ class LLMEngine:
                 lens = torch.full(
                     (bs,),
                     fill_value=int(sl),
-                    dtype=torch.long,
+                    dtype=torch.int32,
                     device=self.device,
                 )
+                
+                block_table = None
+                token_counter = None
+                if self.inference_config.use_paged_kv_caching:
+                    req_ids = [f"warmup_{i}" for i in range(bs)]
+                    token_counter = torch.zeros(
+                        bs, dtype=torch.int32, device=self.device
+                    )
+                    slot_ids = self.kv_slots_manager.allocate(req_ids, lens)
+                    block_table = self.kv_slots_manager.view(slot_ids)
 
-                # Mark B and T dynamic for warmup
+                    dynamo.mark_dynamic(token_counter, 0, min=1, max=self.inference_config.max_batch_size) # B
+                    dynamo.mark_dynamic(block_table, 0, min=1, max=self.inference_config.max_batch_size) # B
+
                 dynamo.mark_dynamic(tokens, 0, min=1, max=self.inference_config.max_batch_size) # B
                 dynamo.mark_dynamic(tokens, 1, min=1, max=1024) # T
                 dynamo.mark_dynamic(lens, 0 , min=1, max=self.inference_config.max_batch_size) # B
-
-                # _ = prefill_logits_last(self.model, tokens, lens, EnginePhase.PREFILL)
 
                 _ = prefill(
                     model=self.model, 
@@ -434,7 +444,9 @@ class LLMEngine:
                     top_k=self.inference_config.top_k,
                     top_p=self.inference_config.top_p,
                     get_logits=False,
-                    phase=EnginePhase.PREFILL
+                    phase=EnginePhase.PREFILL,
+                    block_table=block_table,
+                    token_counter=token_counter,
                 )
                 print_rank0(f"Warmup prefill for batch size {bs} and sequence length {sl} completed")
 
