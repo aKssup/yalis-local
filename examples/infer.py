@@ -37,7 +37,7 @@ if __name__ == "__main__":
     ]
 
     # take 16 prompts from this dataset
-    user_prompts = user_prompts[:6]
+    user_prompts = user_prompts[:1]
     print(f"Number of prompts = {len(user_prompts)}")
 
     system_prompt = (
