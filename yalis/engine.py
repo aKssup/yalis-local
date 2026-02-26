@@ -429,12 +429,21 @@ class LLMEngine:
                     slot_ids = self.kv_slots_manager.allocate(req_ids, lens)
                     block_table = self.kv_slots_manager.view(slot_ids)
 
-                    dynamo.maybe_mark_dynamic(token_counter, 0) # , min=1, max=self.inference_config.max_batch_size) # B
-                    dynamo.maybe_mark_dynamic(block_table, 0) # , min=1, max=self.inference_config.max_batch_size) # B
+                    if bs == 1:
+                        dynamo.maybe_mark_dynamic(token_counter, 0) # B
+                        dynamo.maybe_mark_dynamic(block_table, 0) # B
+                    else:
+                        dynamo.mark_dynamic(token_counter, 0, min=2, max=self.inference_config.max_batch_size) # B
+                        dynamo.mark_dynamic(block_table, 0, min=2, max=self.inference_config.max_batch_size) # B
 
-                dynamo.maybe_mark_dynamic(tokens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
-                dynamo.maybe_mark_dynamic(tokens, 1) # , min=1, max=1024) # T
-                dynamo.maybe_mark_dynamic(lens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
+                if bs == 1:
+                    dynamo.maybe_mark_dynamic(tokens, 0) # B
+                    dynamo.maybe_mark_dynamic(tokens, 1) # T
+                    dynamo.maybe_mark_dynamic(lens, 0) # B
+                else:
+                    dynamo.mark_dynamic(tokens, 0, min=2, max=self.inference_config.max_batch_size) # B
+                    dynamo.mark_dynamic(tokens, 1, min=2, max=1024) # T
+                    dynamo.mark_dynamic(lens, 0, min=2, max=self.inference_config.max_batch_size) # B
 
                 _ = prefill(
                     model=self.model, 
