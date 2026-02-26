@@ -420,9 +420,9 @@ class LLMEngine:
                 )
 
                 # Mark B and T dynamic for warmup
-                # dynamo.mark_dynamic(tokens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
-                # dynamo.mark_dynamic(tokens, 1) # , min=1, max=1024) # T
-                # dynamo.mark_dynamic(lens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
+                dynamo.mark_dynamic(tokens, 0, min=1, max=self.inference_config.max_batch_size) # B
+                dynamo.mark_dynamic(tokens, 1, min=1, max=1024) # T
+                dynamo.mark_dynamic(lens, 0 , min=1, max=self.inference_config.max_batch_size) # B
 
                 # _ = prefill_logits_last(self.model, tokens, lens, EnginePhase.PREFILL)
 
@@ -436,18 +436,6 @@ class LLMEngine:
                     get_logits=False,
                     phase=EnginePhase.PREFILL
                 )
-
-                # NOTE: temp just for reference:
-                # next_token, logits = prefill(
-                #     self.model,
-                #     current_input_to_model,
-                #     prompt_sequence_lengths,
-                #     temperature=self.inference_config.temperature,
-                #     top_k=self.inference_config.top_k,
-                #     top_p=self.inference_config.top_p,
-                #     get_logits=get_logits,
-                # )  # Call prefill function
-
                 print_rank0(f"Warmup prefill for batch size {bs} and sequence length {sl} completed")
 
         torch.cuda.synchronize()

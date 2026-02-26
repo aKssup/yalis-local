@@ -85,7 +85,7 @@ if __name__ == "__main__":
         temperature=1.0,
         tp_dims=None,
         attention_backend="flash",
-        use_paged_kv_caching=False, # or True?
+        use_paged_kv_caching=True,
         prestore_kv_cache=True,
     )
 
@@ -93,13 +93,13 @@ if __name__ == "__main__":
         model_config=model_config, inference_config=inference_config
     )
 
-    # # NOTE: WARMUP CODE
-    # warmup_start = time.perf_counter()
-    # engine.warmup(
-    #     prefill_configs = [(1, 64), ((MAX_BATCH_SIZE // 2), 256), (MAX_BATCH_SIZE, 1024)]
-    # )
-    # warmup_elapsed = time.perf_counter() - warmup_start
-    # print_rank0(f"Warmup completed in {warmup_elapsed:.2f}s")
+    # NOTE: WARMUP CODE
+    warmup_start = time.perf_counter()
+    engine.warmup(
+        prefill_configs = [(MAX_BATCH_SIZE, 1024)] # [(1, 64), ((MAX_BATCH_SIZE // 2), 256), (MAX_BATCH_SIZE, 1024)]
+    )
+    warmup_elapsed = time.perf_counter() - warmup_start
+    print_rank0(f"Warmup completed in {warmup_elapsed:.2f}s")
 
     if enable_profiling:
         profiler_context = torch.profiler.profile(
