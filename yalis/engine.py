@@ -21,23 +21,26 @@ from .timers import Timers
 
 import os
 
+import torch._dynamo as dynamo
+
 # TODO: these should be dynamically set during engine initialization
 NUM_BLOCKS, PAGE_BLOCK_SIZE = 512, 256
 
 # These flags are taken from the following URL -
 # https://github.com/pytorch/pytorch/blob/347f96061f1cff603983b9be19ec92b374329a5b/benchmarks/gpt_fast/generate.py#L19
 
-torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.coordinate_descent_tuning = False
 
-torch._inductor.config.triton.unique_kernel_names = True
+torch._inductor.config.triton.unique_kernel_names = False
 
 # Experimental feature to reduce compile times, will be on by default in future
 torch._inductor.config.fx_graph_cache = True
 
 torch._inductor.config.assert_indirect_indexing = False
 
-torch._inductor.config.combo_kernel_foreach_dynamic_shapes = True
+torch._inductor.config.combo_kernel_foreach_dynamic_shapes = False
 
+dynamo.config.dynamic_shapes = True 
 
 YALIS_DISABLE_COMPILE = os.environ.get("YALIS_DISABLE_COMPILE", "0") == "1"
 
@@ -367,6 +370,98 @@ class LLMEngine:
                 f"tokens_to_generate has been adjusted to {tokens_to_generate}"
             )
         return tokens_to_generate
+
+    def _fake_tokens(self, batch_size, seq_length) -> torch.Tensor:
+        """Create tokens with BOS on device with shape (bs, seqlen)."""
+        bos = getattr(self.tokenizer, "bos_token_id", None)
+        if bos is None:
+            raise ValueError("BOS token is none.")
+        return torch.full(
+            (batch_size, seq_length),
+            fill_value=int(bos),
+            device=self.device,
+            dtype=torch.long,
+        )
+
+    def _reset_warmup_states(self, batch_size):
+        """Per-warmup request, reset token_counter and for paged kv cache, reset the manager."""
+        # NOTE: doesn't account for spec dec
+        if self.model.token_counter is None:
+            raise ValueError("Token counter is None.")
+
+        if batch_size is None:
+            self.model.token_counter.zero_()
+        else:
+            self.model.token_counter[:batch_size].zero_()
+
+        if self.inference_config.use_paged_kv_caching:
+            self.model.kv_cache_manager.reset()
+
+    def warmup_prefill(
+        self,
+        prefill_configs,
+    ) -> None:
+        """Warmup prefill by calling module level prefill path"""
+        if prefill_configs is None:
+            raise ValueError("prefill_configs must be provided.")
+
+        with torch.inference_mode(), torch.autocast(
+            self.device, dtype=self.dtype, cache_enabled=False
+        ):
+            for bs, sl in prefill_configs:
+                print_rank0(f"Warmup prefill for batch size {bs} and sequence length {sl}")
+                self._reset_warmup_states(bs)
+                tokens = self._fake_tokens(bs, sl)  # (bs, sl)
+                lens = torch.full(
+                    (bs,),
+                    fill_value=int(sl),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+                # Mark B and T dynamic for warmup
+                # dynamo.mark_dynamic(tokens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
+                # dynamo.mark_dynamic(tokens, 1) # , min=1, max=1024) # T
+                # dynamo.mark_dynamic(lens, 0) # , min=1, max=self.inference_config.max_batch_size) # B
+
+                # _ = prefill_logits_last(self.model, tokens, lens, EnginePhase.PREFILL)
+
+                _ = prefill(
+                    model=self.model, 
+                    tokens=tokens, 
+                    unpadded_prompt_lengths=lens,
+                    temperature=self.inference_config.temperature,
+                    top_k=self.inference_config.top_k,
+                    top_p=self.inference_config.top_p,
+                    get_logits=False,
+                    phase=EnginePhase.PREFILL
+                )
+
+                # NOTE: temp just for reference:
+                # next_token, logits = prefill(
+                #     self.model,
+                #     current_input_to_model,
+                #     prompt_sequence_lengths,
+                #     temperature=self.inference_config.temperature,
+                #     top_k=self.inference_config.top_k,
+                #     top_p=self.inference_config.top_p,
+                #     get_logits=get_logits,
+                # )  # Call prefill function
+
+                print_rank0(f"Warmup prefill for batch size {bs} and sequence length {sl} completed")
+
+        torch.cuda.synchronize()
+
+    def warmup(
+        self,
+        prefill_configs,
+    ) -> None:
+        """Warmup by calling prefill and decode"""
+        print("Prefill warmup start.")
+        self.warmup_prefill(
+            prefill_configs=prefill_configs,
+        )
+        print(f"Prefill warmup end.")
 
     def generate(
         self,
